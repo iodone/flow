@@ -1,14 +1,17 @@
 import logging
+import threading
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass
 from inspect import signature
-from queue import Queue
+from queue import Empty, Queue
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 
 from lmnr import Laminar, observe
+
+from lmnr_flow.executor import Executor
 
 from .context import Context
 from .state import State
@@ -52,17 +55,59 @@ class StreamChunk:
     value: Any
 
 
-class Flow:
-    def __init__(
-        self,
-        thread_pool_executor: ThreadPoolExecutor,
-        context: Optional[Context] = None,
+def execute_task(
+    action: Callable[[Context], TaskOutput],
+    task: NextTask,
+    context: Context,
+    logger: logging.Logger,
+) -> TaskOutput:
+    """Execute a task and return its output
+
+    Args:
+        action: The task function to execute
+        task: The task configuration
+        context: Context for task execution
+        logger: Logger for error reporting
+
+    Returns:
+        TaskOutput containing the task's result
+    """
+    logger.info(f"Starting execution of task '{task.id}'")
+
+    with Laminar.start_as_current_span(
+        task.id,
+        input={"context": context.to_dict(), "inputs": task.inputs},
     ):
+        # Check if action accepts inputs parameter
+        sig = signature(action)
+        params = list(sig.parameters.keys())
+
+        # 根据函数签名决定如何调用 action
+        if len(params) > 1 and params[1] == "inputs":  # 第一个参数是 context
+            result = action(context, inputs=task.inputs)
+        else:
+            result = action(context)
+
+        Laminar.set_span_output(result)
+
+    return result
+
+
+class Flow:
+    """Flow execution engine that manages task scheduling and execution"""
+
+    def __init__(self, executor: Executor, context: Optional[Context] = None):
+        """Initialize Flow with an executor
+
+        Args:
+            executor: Task executor implementation
+            context: Optional shared context
+        """
         self.tasks = {}  # str -> Task
         self.active_tasks = set()  # Set of str
         self.context = context or Context()  # Global context
         self.output_task_ids = set()  # Set of str
-        self._executor = thread_pool_executor
+        self._executor = executor
 
         # Thread-safety locks
         self.active_tasks_lock = Lock()
@@ -100,82 +145,6 @@ class Flow:
 
         return decorator
 
-    def execute_task(
-        self,
-        action: Callable[[Context], TaskOutput],
-        task: NextTask,
-        task_queue: Queue,
-        stream_queue: Optional[Queue] = None,
-    ):
-        self.logger.info(f"Starting execution of task '{task.id}'")
-
-        try:
-            with Laminar.start_as_current_span(
-                task.id,
-                input={"context": self.context.to_dict(), "inputs": task.inputs},
-            ):
-                # Check if action accepts inputs parameter
-                sig = signature(action)
-                if "inputs" in sig.parameters:
-                    result: TaskOutput = action(self.context, inputs=task.inputs)
-                else:
-                    result: TaskOutput = action(self.context)
-                Laminar.set_span_output(result)
-
-            # Set state to the output of the task
-            self.context.set(task.id, result.output)
-
-            # Push to stream queue if it exists
-            if stream_queue is not None:
-                stream_queue.put(StreamChunk(task.id, result.output))
-
-            with self.active_tasks_lock:
-                self.active_tasks.remove(task.id)
-                self.logger.info(f"Completed execution of task '{task.id}'")
-
-                # If no next tasks specified, this is an output task
-                if not result.next_tasks or len(result.next_tasks) == 0:
-                    self.logger.info(f"Task '{task.id}' completed as output node")
-                    with self.output_ids_lock:
-                        self.output_task_ids.add(task.id)
-                        task_queue.put(NextTask(__OUTPUT__, None))
-                else:
-                    self.logger.debug(
-                        f"Task '{task.id}' scheduling next tasks: {result.next_tasks}"
-                    )
-
-                    for next_task in result.next_tasks:
-                        if next_task.id.split(__HASH_SPLIT__)[0] in self.tasks:
-                            if next_task.id not in self.active_tasks:
-                                self.active_tasks.add(next_task.id)
-                                task_queue.put(NextTask(next_task.id, next_task.inputs))
-                            elif next_task.spawn_another:
-                                self.logger.info(
-                                    f"Spawning another instance of task '{next_task.id}'"
-                                )
-                                task_id_with_hash = (
-                                    next_task.id
-                                    + __HASH_SPLIT__
-                                    + str(uuid.uuid4())[0:8]
-                                )
-                                self.active_tasks.add(task_id_with_hash)
-                                task_queue.put(
-                                    NextTask(task_id_with_hash, next_task.inputs)
-                                )
-                        else:
-                            raise Exception(f"Task {next_task.id} not found")
-
-        except Exception as e:
-            self.context.set(
-                __ERROR__, {"error": str(e), "traceback": traceback.format_exc()}
-            )
-            with self.active_tasks_lock:
-                self.active_tasks.clear()
-
-            task_queue.put(NextTask(__ERROR__, None))
-
-            raise e
-
     @observe(name="flow.run")
     def run(
         self, start_task_id: str, inputs: Optional[Dict[str, Any]] = None
@@ -183,7 +152,7 @@ class Flow:
         self.logger.info(f"Starting engine run with initial task: {start_task_id}")
         # thread-safe queue of task ids
         task_queue = Queue()
-        futures = set()
+        futures = dict[str, Future]()
 
         self.active_tasks.add(start_task_id)
         task_queue.put(NextTask(start_task_id, inputs))
@@ -194,38 +163,117 @@ class Flow:
 
         # Main execution loop
         while True:
-            next_task = task_queue.get()
+            try:
+                next_task = task_queue.get_nowait()  # 使用非阻塞方式获取任务
+            except Empty:
+                # 队列为空时直接处理futures
+                pass
+            else:
+                # 处理获取到的任务
+                if next_task.id == __ERROR__:
+                    # Cancel all pending futures on error
+                    for _, f in futures.items():
+                        f.cancel()
+                    err = self.context.get(__ERROR__)
+                    raise Exception(err)
 
-            if next_task.id == __ERROR__:
-                # Cancel all pending futures on error
-                for f in futures:
-                    f.cancel()
-
-                err = self.context.get(__ERROR__)
-                raise Exception(err)
-
-            if next_task.id == __OUTPUT__:
-                with self.active_tasks_lock:
+                if next_task.id == __OUTPUT__:
                     if len(self.active_tasks) == 0:
                         break
-                continue
+                    continue
 
-            action = self.tasks[next_task.id.split(__HASH_SPLIT__)[0]].action
+                action = self.tasks[next_task.id.split(__HASH_SPLIT__)[0]].action
 
-            future = self._executor.submit(
-                self.execute_task, action, next_task, task_queue
-            )
-            futures.add(future)
+                future = self._executor.submit(
+                    execute_task,
+                    action,
+                    next_task,
+                    self.context,
+                    self.logger,
+                )
+                futures[next_task.id] = future
 
-        # Return values of the output nodes
-        # task_id -> value of the task
+            completed_futures_ids = set()
+            for task_id, f in futures.items():
+                if f.done():
+                    try:
+                        result: TaskOutput = f.result()
+                        # Update context with task output
+                        self.context.set(task_id, result.output)
+
+                        self.active_tasks.remove(task_id)
+                        self.logger.info(f"Completed execution of task '{task_id}'")
+
+                        # If no next tasks specified, this is an output task
+                        if not result.next_tasks or len(result.next_tasks) == 0:
+                            self.logger.info(
+                                f"Task '{task_id}' completed as output node"
+                            )
+                            self.output_task_ids.add(task_id)
+                            task_queue.put(NextTask(__OUTPUT__, None))
+                        else:
+                            self.logger.debug(
+                                f"Task '{task_id}' scheduling next tasks: {result.next_tasks}"
+                            )
+                            for next_task in result.next_tasks:
+                                if (
+                                    next_task.id.split(__HASH_SPLIT__)[0]
+                                    in self.tasks
+                                ):
+                                    if next_task.id not in self.active_tasks:
+                                        self.active_tasks.add(next_task.id)
+                                        task_queue.put(
+                                            NextTask(
+                                                next_task.id, next_task.inputs
+                                            )
+                                        )
+                                    elif next_task.spawn_another:
+                                        self.logger.info(
+                                            f"Spawning another instance of task '{next_task.id}'"
+                                        )
+                                        task_id_with_hash = (
+                                            next_task.id
+                                            + __HASH_SPLIT__
+                                            + str(uuid.uuid4())[0:8]
+                                        )
+                                        self.active_tasks.add(task_id_with_hash)
+                                        task_queue.put(
+                                            NextTask(
+                                                task_id_with_hash,
+                                                next_task.inputs,
+                                            )
+                                        )
+                                else:
+                                    raise Exception(
+                                        f"Task {next_task.id} not found"
+                                    )
+
+                    except Exception as e:
+                        self.context.set(
+                            __ERROR__,
+                            {
+                                "error": str(e),
+                                "traceback": traceback.format_exc(),
+                            },
+                        )
+                        self.logger.error(
+                            f"Error in exectuting for task '{task_id}': {str(e)}"
+                        )
+                        self.active_tasks.clear()
+                        task_queue.put(NextTask(__ERROR__, None))
+
+                    completed_futures_ids.add(task_id)
+
+            for task_id in completed_futures_ids:
+                del futures[task_id]
+
+        # Return outputs of final tasks
         return {task_id: self.context.get(task_id) for task_id in self.output_task_ids}
 
     @observe(name="flow.stream")
     def stream(self, start_task_id: str, inputs: Optional[Dict[str, Any]] = None):
         task_queue = Queue()
         stream_queue = Queue()
-        futures = set()
 
         self.active_tasks.add(start_task_id)
         task_queue.put(NextTask(start_task_id, inputs))
@@ -236,33 +284,123 @@ class Flow:
 
         self.context.set_stream(stream_queue)
 
-        def run_engine():
+        def run_engine(task_queue: Queue, stream_queue: Queue):
+            futures = dict[str, Future]()
+            # Main execution loop
             while True:
-                next_task = task_queue.get()
+                try:
+                    next_task = task_queue.get_nowait()  # 使用非阻塞方式获取任务
+                except Empty:
+                    # 队列为空时直接处理futures
+                    pass
+                else:
+                    # 处理获取到的任务
+                    if next_task.id == __ERROR__:
+                        # Cancel all pending futures on error
+                        for _, f in futures.items():
+                            f.cancel()
+                        stream_queue.put(StreamChunk(__ERROR__, None))  # Signal completion
+                        break
 
-                if next_task.id == __ERROR__:
-                    for f in futures:
-                        f.cancel()
-                    stream_queue.put(StreamChunk(__ERROR__, None))  # Signal completion
-                    break
-
-                if next_task.id == __OUTPUT__:
-                    with self.active_tasks_lock:
+                    if next_task.id == __OUTPUT__:
                         if len(self.active_tasks) == 0:
-                            stream_queue.put(
-                                StreamChunk(__OUTPUT__, None)
-                            )  # Signal completion
+                            stream_queue.put(StreamChunk(__OUTPUT__, None))  # Signal completion
                             break
-                    continue
+                        continue
 
-                action = self.tasks[next_task.id.split(__HASH_SPLIT__)[0]].action
+                    action = self.tasks[next_task.id.split(__HASH_SPLIT__)[0]].action
 
-                future = self._executor.submit(
-                    self.execute_task, action, next_task, task_queue, stream_queue
-                )
-                futures.add(future)
+                    future = self._executor.submit(
+                        execute_task,
+                        action,
+                        next_task,
+                        self.context,
+                        self.logger,
+                    )
+                    futures[next_task.id] = future
 
-        self._executor.submit(run_engine)
+                completed_futures_ids = set()
+                for task_id, f in futures.items():
+                    if f.done():
+                        try:
+                            result: TaskOutput = f.result()
+                            # Update context with task output
+                            self.context.set(task_id, result.output)
+
+                            # Push to stream queue if it exists
+                            stream_queue.put(StreamChunk(task_id, result.output))
+
+                            self.active_tasks.remove(task_id)
+                            self.logger.info(
+                                f"Completed execution of task '{task_id}'"
+                            )
+
+                            # If no next tasks specified, this is an output task
+                            if not result.next_tasks or len(result.next_tasks) == 0:
+                                self.logger.info(
+                                    f"Task '{task_id}' completed as output node"
+                                )
+                                self.output_task_ids.add(task_id)
+                                task_queue.put(NextTask(__OUTPUT__, None))
+                            else:
+                                self.logger.debug(
+                                    f"Task '{task_id}' scheduling next tasks: {result.next_tasks}"
+                                )
+                                for next_task in result.next_tasks:
+                                    if (
+                                        next_task.id.split(__HASH_SPLIT__)[0]
+                                        in self.tasks
+                                    ):
+                                        if next_task.id not in self.active_tasks:
+                                            self.active_tasks.add(next_task.id)
+                                            task_queue.put(
+                                                NextTask(
+                                                    next_task.id, next_task.inputs
+                                                )
+                                            )
+                                        elif next_task.spawn_another:
+                                            self.logger.info(
+                                                f"Spawning another instance of task '{next_task.id}'"
+                                            )
+                                            task_id_with_hash = (
+                                                next_task.id
+                                                + __HASH_SPLIT__
+                                                + str(uuid.uuid4())[0:8]
+                                            )
+                                            self.active_tasks.add(task_id_with_hash)
+                                            task_queue.put(
+                                                NextTask(
+                                                    task_id_with_hash,
+                                                    next_task.inputs,
+                                                )
+                                            )
+                                    else:
+                                        raise Exception(
+                                            f"Task {next_task.id} not found"
+                                        )
+
+                        except Exception as e:
+                            self.context.set(
+                                __ERROR__,
+                                {
+                                    "error": str(e),
+                                    "traceback": traceback.format_exc(),
+                                },
+                            )
+                            self.logger.error(
+                                f"Error in exectuting for task '{task_id}': {str(e)}"
+                            )
+                            self.active_tasks.clear()
+                            task_queue.put(NextTask(__ERROR__, None))
+
+                        completed_futures_ids.add(task_id)
+
+                for task_id in completed_futures_ids:
+                    del futures[task_id]
+
+        # Start engine in a separate thread
+        thread = threading.Thread(target=run_engine, args=(task_queue, stream_queue))
+        thread.start()
 
         # Yield results from stream queue
         while True:

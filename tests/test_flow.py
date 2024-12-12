@@ -1,4 +1,3 @@
-import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -8,14 +7,8 @@ from lmnr.openllmetry_sdk.tracing.tracing import TracerWrapper
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
 
+from lmnr_flow.executor import PoolExecutor
 from src.lmnr_flow.flow import Context, Flow, NextTask, StreamChunk, TaskOutput
-
-# Configure logging with thread information
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(threadName)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
-    force=True,
-)
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +53,7 @@ def mock_start_as_current_span():
 @pytest.fixture
 def thread_pool():
     with ThreadPoolExecutor(max_workers=2) as executor:
-        yield executor
+        yield PoolExecutor(executor)
 
 
 @pytest.fixture
@@ -80,7 +73,6 @@ def test_simple_task_execution(flow):
     # Test single task that returns no next tasks
     def action(ctx):
         return TaskOutput("result")
-
     flow.add_task("task1", action)
     result = flow.run("task1")
 

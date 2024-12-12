@@ -10,13 +10,22 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    "lmnr>=0.4.43"
+    "lmnr>=0.4.43",
+    "ray>=2.2.0"
 ]
 
 [tool.uv]
 dev-dependencies = [
     "pytest>=8.3.3"
 ]
+[tool.pytest.ini_options]
+pythonpath = [
+    "src"
+]
+testpaths = [
+    "tests"
+]
+addopts = "-s"
 
 [project.urls]
 "Homepage" = "https://github.com/lmnr-ai/flow"
